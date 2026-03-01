@@ -4,17 +4,10 @@
 #include <vector>
 #include <string>
 #include <filesystem>
-#include <algorithm> // Required for std::count
 
 int main() {
+    // 1. Setup
     std::string model_path = "models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
-    std::string prompt;
-
-    if (!std::filesystem::exists(model_path)) {
-        std::cerr << "[Error] Model file not found." << std::endl;
-        return 1;
-    }
-
     llama_backend_init();
 
     llama_model_params m_params = llama_model_default_params();
@@ -22,67 +15,53 @@ int main() {
     if (!model) return 1;
 
     llama_context_params c_params = llama_context_default_params();
-    c_params.n_ctx = 2048; 
+    c_params.n_ctx = 2048;
     llama_context * ctx = llama_new_context_with_model(model, c_params);
-    if (!ctx) return 1;
-
     const struct llama_vocab * vocab = llama_model_get_vocab(model);
 
-    std::cout << "\n--- PROMPT ---\n";
-    std::getline(std::cin, prompt);
-    std::cout << "\n--- RESPONSE ---\n";
+    // 2. THE SAMPLER CHAIN (Fixed Identifiers)
+    struct llama_sampler * smpl = llama_sampler_chain_init(llama_sampler_chain_default_params());
 
+    // In current llama.cpp, repetition/freq/presence are often combined:
+    // llama_sampler_init_penalties(penalty_last_n, repeat_penalty, freq_penalty, present_penalty)
+    // If 'repetition_penalty' isn't found, this is the official replacement:
+    llama_sampler_chain_add(smpl, llama_sampler_init_penalties(64, 1.1f, 0.0f, 0.0f));
+    
+    // Standard variety samplers
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(0.95f, 1));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(0.7f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+
+    // 3. Inference
+    std::string prompt = "Write a short poem about C++ coding.";
     int n_tokens = -llama_tokenize(vocab, prompt.c_str(), prompt.length(), NULL, 0, true, true);
     std::vector<llama_token> tokens(n_tokens);
     llama_tokenize(vocab, prompt.c_str(), prompt.length(), tokens.data(), tokens.size(), true, true);
 
-    // --- REPETITION TRACKING (Pure C++) ---
-    std::vector<llama_token> history;
-    const int window_size = 20; // Look back at the last 20 tokens
-    const int max_repeats = 3;  // Stop if a token appears more than 3 times in that window
-
+    std::cout << "\n--- RESPONSE ---\n";
     for (int i = 0; i < 200; i++) {
         llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
-        
         if (llama_decode(ctx, batch) != 0) break;
 
-        // Your original Greedy Sampling logic (This we know works!)
-        auto logits = llama_get_logits_ith(ctx, batch.n_tokens - 1);
-        llama_token next_token = 0;
-        float max_logit = -1e10;
-        for (int id = 0; id < llama_n_vocab(vocab); id++) {
-            if (logits[id] > max_logit) {
-                max_logit = logits[id];
-                next_token = id;
-            }
-        }
+        // Sample using the chain
+        llama_token next_token = llama_sampler_sample(smpl, ctx, -1);
 
         if (next_token == llama_token_eos(vocab)) break;
 
-        // --- THE FIX: MANUAL REPETITION CHECK ---
-        history.push_back(next_token);
-        if (history.size() > window_size) {
-            history.erase(history.begin());
-        }
+        // IMPORTANT: Updates sampler memory so it knows NOT to repeat this token
+        llama_sampler_accept(smpl, next_token);
 
-        // Count how many times this specific token has appeared recently
-        if (std::count(history.begin(), history.end(), next_token) > max_repeats) {
-            std::cout << "\n[Stopping: Repetition Detected]";
-            break;
-        }
-
-        // Convert to string and print
         char buf[128];
         int n = llama_token_to_piece(vocab, next_token, buf, sizeof(buf), 0, true);
         if (n > 0) {
             std::cout << std::string(buf, n);
             std::fflush(stdout);
         }
-
         tokens = {next_token};
     }
 
-    std::cout << "\n--- DONE ---\n";
+    // 4. Cleanup
+    llama_sampler_free(smpl);
     llama_free(ctx);
     llama_free_model(model);
     llama_backend_free();
