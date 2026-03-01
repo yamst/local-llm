@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 set(LLAMA_BUILD_COMMON ON CACHE BOOL "" FORCE)
+set(LLAMA_CURL OFF CACHE BOOL "" FORCE)
 
 # 2. Add llama.cpp as a subdirectory
 # This makes 'llama' and 'common' targets available to link against
