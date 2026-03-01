@@ -9,7 +9,7 @@ int main() {
     // 1. Path Configuration
     // Adjust this if your 'models' folder is in a different spot relative to the .exe
     std::string model_path = "models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
-    std::string prompt = "void quicksort(int arr[], int n) {";
+    std::string prompt;
 
     std::cout << "[Info] Working Directory: " << std::filesystem::current_path() << std::endl;
 
@@ -49,6 +49,13 @@ int main() {
     const struct llama_vocab * vocab = llama_model_get_vocab(model);
     std::cout << "[Info] Model loaded. Starting generation..." << std::endl;
 
+    
+
+    // 7. Prediction Loop
+    std::cout << "\n--- PROMPT ---\n";
+    std::getline(std::cin, prompt);
+    std::cout << "\n--- RESPONSE ---\n";
+
     // 6. Tokenize Prompt
     // llama_tokenize returns negative count on failure/sizing
     int n_tokens = -llama_tokenize(vocab, prompt.c_str(), prompt.length(), NULL, 0, true, true);
@@ -57,9 +64,6 @@ int main() {
         std::cerr << "[Error] Failed to tokenize prompt." << std::endl;
         return 1;
     }
-
-    // 7. Prediction Loop
-    std::cout << "\n--- PROMPT ---\n" << prompt << "\n--- RESPONSE ---\n";
 
     for (int i = 0; i < 100; i++) {
         // Prepare batch
