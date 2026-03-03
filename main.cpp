@@ -9,7 +9,7 @@
 #include <thread>    
 #include <algorithm> 
 #include <sstream>
-#include <chrono> // For measurement
+#include <chrono>
 
 int main(int argc, char ** argv) {
     if (argc < 3) {
@@ -21,28 +21,26 @@ int main(int argc, char ** argv) {
     std::string output_path = argv[2];
     std::string model_path  = "models/qwen2.5-coder-1.5b-instruct-q4_k_m.gguf";
 
-    // 1. Read input file
+    // 1. Read input
     std::ifstream infile(input_path);
-    if (!infile.is_open()) {
-        std::cerr << "Error: Could not open input file " << input_path << std::endl;
-        return 1;
-    }
+    if (!infile.is_open()) return 1;
     std::stringstream buffer;
     buffer << infile.rdbuf();
     std::string content = buffer.str();
     infile.close();
 
-    // 2. Setup Llama
+    // 2. Setup (Force n_gpu_layers high for real speed)
     llama_backend_init();
     llama_model_params m_params = llama_model_default_params();
-    m_params.n_gpu_layers = 10; 
+    m_params.n_gpu_layers = 99; 
 
     llama_model * model = llama_load_model_from_file(model_path.c_str(), m_params);
     if (!model) return 1;
 
     llama_context_params c_params = llama_context_default_params();
-    c_params.n_ctx = std::max(2048, (int)content.length());
-    c_params.n_threads = std::max(1u, std::thread::hardware_concurrency() / 2);
+    c_params.n_ctx = std::max(4096, (int)content.length() / 2); // Buffer room
+    c_params.n_batch = 512; // Crucial: allow processing 512 tokens at once
+    c_params.n_threads = std::thread::hardware_concurrency();
     
     llama_context * ctx = llama_new_context_with_model(model, c_params);
     const struct llama_vocab * vocab = llama_model_get_vocab(model);
@@ -53,61 +51,55 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> tokens(n_tokens);
     llama_tokenize(vocab, content.c_str(), content.length(), tokens.data(), tokens.size(), true, true);
 
-    // 4. Open Output File
     std::ofstream outfile(output_path);
-    if (!outfile.is_open()) {
-        std::cerr << "Error: Could not open output file " << output_path << std::endl;
-        return 1;
-    }
+    outfile << "Token | Probability (%)\n------------------\n";
 
-    outfile << std::left << std::setw(25) << "Token" << " | " << "Probability (%)" << "\n";
-    outfile << "--------------------------------------------------\n";
-
-    std::cout << "Starting analysis of " << n_tokens << " tokens..." << std::endl;
+    std::cout << "Starting Batch Analysis of " << n_tokens << " tokens..." << std::endl;
 
     // --- START MEASUREMENT ---
     auto t_start = std::chrono::high_resolution_clock::now();
 
-    for (int i = 0; i < n_tokens - 1; i++) {
-        llama_batch batch = llama_batch_get_one(&tokens[i], 1);
+    int n_batch = c_params.n_batch;
+    for (int i = 0; i < n_tokens - 1; i += n_batch) {
+        int n_eval = std::min(n_batch, n_tokens - 1 - i);
+
+        // Build a batch for multiple tokens
+        llama_batch batch = llama_batch_init(n_eval, 0, 1);
+        for (int j = 0; j < n_eval; j++) {
+            // common_batch_add is a helper from common.h
+            // We set 'logits = true' for EVERY token in the batch so we can read them back
+            common_batch_add(batch, tokens[i + j], i + j, { 0 }, true);
+        }
+
         if (llama_decode(ctx, batch) != 0) break;
 
-        float * logits = llama_get_logits_ith(ctx, 0);
-        llama_token actual_next = tokens[i+1];
+        // Extract probabilities for each token in the batch
+        for (int j = 0; j < n_eval; j++) {
+            float * logits = llama_get_logits_ith(ctx, j);
+            llama_token actual_next = tokens[i + j + 1];
 
-        // Softmax
-        float max_l = logits[0];
-        for (int v = 1; v < n_vocab; v++) if (logits[v] > max_l) max_l = logits[v];
-        
-        double sum = 0.0;
-        for (int v = 0; v < n_vocab; v++) sum += std::exp((double)logits[v] - max_l);
-        double prob = std::exp((double)logits[actual_next] - max_l) / sum;
+            // Softmax
+            float max_l = logits[0];
+            for (int v = 1; v < n_vocab; v++) if (logits[v] > max_l) max_l = logits[v];
+            double sum = 0.0;
+            for (int v = 0; v < n_vocab; v++) sum += std::exp((double)logits[v] - max_l);
+            double prob = std::exp((double)logits[actual_next] - max_l) / sum;
 
-        char buf[128];
-        int n = llama_token_to_piece(vocab, actual_next, buf, sizeof(buf), 0, true);
-        std::string piece = (n > 0) ? std::string(buf, n) : "???";
-        
-        size_t p = 0;
-        while ((p = piece.find("\n", p)) != std::string::npos) { piece.replace(p, 1, "\\n"); p += 2; }
+            char buf[128];
+            int n = llama_token_to_piece(vocab, actual_next, buf, sizeof(buf), 0, true);
+            std::string piece(buf, (n > 0 ? n : 0));
+            
+            outfile << piece << " | " << (prob * 100.0) << "\n";
+        }
 
-        outfile << std::left << std::setw(25) << piece 
-                << " | " << std::fixed << std::setprecision(6) << (prob * 100.0) << "\n";
-        
-        if (i % 20 == 0) std::cout << "\rProgress: " << (i * 100 / n_tokens) << "%" << std::flush;
+        llama_batch_free(batch);
+        std::cout << "\rProgress: " << (i * 100 / n_tokens) << "%" << std::flush;
     }
 
     auto t_end = std::chrono::high_resolution_clock::now();
-    // --- END MEASUREMENT ---
-
     double duration = std::chrono::duration<double>(t_end - t_start).count();
-    double tps = (n_tokens - 1) / duration;
 
-    std::cout << "\rAnalysis complete!                                \n";
-    std::cout << "----------------------------------\n";
-    std::cout << "Analysis Time: " << std::fixed << std::setprecision(3) << duration << " seconds\n";
-    std::cout << "Analysis Speed: " << std::fixed << std::setprecision(2) << tps << " tokens/sec\n";
-    std::cout << "Results saved to: " << output_path << "\n";
-    std::cout << "----------------------------------\n";
+    std::cout << "\nAnalysis Time: " << duration << "s (" << (n_tokens / duration) << " t/s)\n";
 
     outfile.close();
     llama_free(ctx);
